@@ -1,12 +1,15 @@
 package kvraft
 
 import (
-	"6.5840/labgob"
-	"6.5840/labrpc"
-	"6.5840/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
 )
 
 const Debug = false
@@ -18,11 +21,15 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Command   string
+	ClientId  int64
+	CommandId int
+	Key       string
+	Value     string
 }
 
 type KVServer struct {
@@ -35,8 +42,191 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+
+	// appliedindex
+	LastApplied  int
+	StateMachine KVStateMachine
+
+	// clientId to commandId
+	ClientId2ComId map[int64]int
+
+	// commandId to command
+	ComNotify map[int]chan Op
 }
 
+type KVStateMachine interface {
+	Get(key string) (string, Err)
+	Put(key, value string) Err
+	Append(key, value string) Err
+}
+
+// kv datebase implement kvstatemachine
+type MemoryKV struct {
+	KV map[string]string
+}
+
+func (kv *MemoryKV) Get(key string) (string, Err) {
+	value, ok := kv.KV[key]
+	if ok {
+		return value, OK
+	}
+	return "", ErrNoKey
+}
+
+func (kv *MemoryKV) Put(key, value string) Err {
+	kv.KV[key] = value
+	return OK
+}
+
+func (kv *MemoryKV) Append(key, value string) Err {
+	kv.KV[key] += value
+	return OK
+}
+
+func (kv *KVServer) applyStateMachine(op *Op) {
+	switch op.Command {
+	case "Put":
+		kv.StateMachine.Put(op.Key, op.Value)
+	case "Append":
+		kv.StateMachine.Append(op.Key, op.Value)
+	}
+}
+
+func (kv *KVServer) GetChan(index int) chan Op {
+	ch, ok := kv.ComNotify[index]
+	if !ok {
+		ch = make(chan Op, 1)
+		kv.ComNotify[index] = ch
+	}
+	return ch
+}
+
+// persist
+func (kv *KVServer) PersisterSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.StateMachine)
+	e.Encode(kv.ClientId2ComId)
+	return w.Bytes()
+}
+
+func (kv *KVServer) DecodeSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var StateMachine MemoryKV
+	var ClientId2ComId map[int64]int
+	if d.Decode(&StateMachine) != nil || d.Decode(&ClientId2ComId) != nil {
+
+	} else {
+		kv.StateMachine = &StateMachine
+		kv.ClientId2ComId = ClientId2ComId
+	}
+}
+
+func (kv *KVServer) apply() {
+	for !kv.killed() {
+		select {
+
+		// server get applych from raftnote
+		case ch := <-kv.applyCh:
+			// an apply
+			if ch.CommandValid {
+				kv.mu.Lock()
+				if ch.CommandIndex <= kv.LastApplied {
+					kv.mu.Unlock()
+					continue
+				}
+				kv.LastApplied = ch.CommandIndex
+
+				opchan := kv.GetChan(ch.CommandIndex)
+				op := ch.Command.(Op)
+
+				// apply to stateMachine(kvdatebase)
+				if kv.ClientId2ComId[op.ClientId] < op.CommandId {
+					kv.applyStateMachine(&op)
+					kv.ClientId2ComId[op.ClientId] = op.CommandId
+				}
+
+				if kv.maxraftstate != -1 && kv.rf.GetRaftStateSize() > kv.maxraftstate {
+					kv.rf.Snapshot(ch.CommandIndex, kv.PersisterSnapshot())
+				}
+
+				kv.mu.Unlock()
+				opchan <- op
+			}
+
+			// a snap
+			if ch.SnapshotValid {
+				kv.mu.Lock()
+				if ch.SnapshotIndex > kv.LastApplied {
+					kv.DecodeSnapshot(ch.Snapshot)
+					kv.LastApplied = ch.SnapshotIndex
+				}
+				kv.mu.Unlock()
+			}
+
+		}
+	}
+}
+
+// rpc
+func (kv *KVServer) Command(args *CommandArgs, reply *CommandReply) {
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	kv.mu.Lock()
+
+	// old commandId for put or append method
+	if args.Op != "Get" && kv.ClientId2ComId[args.ClientId] >= args.CommandId {
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	op := Op{
+		Key:       args.Key,
+		Value:     args.Value,
+		Command:   args.Op,
+		CommandId: args.CommandId,
+		ClientId:  args.ClientId,
+	}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+
+		return
+	}
+	kv.mu.Lock()
+	ch := kv.GetChan(index)
+	kv.mu.Unlock()
+
+	select {
+	case apply := <-ch:
+		if apply.ClientId == op.ClientId && apply.CommandId == op.CommandId {
+			if args.Op == "Get" {
+				kv.mu.Lock()
+				reply.Value, reply.Err = kv.StateMachine.Get(apply.Key)
+				kv.mu.Unlock()
+			}
+			reply.Err = OK
+		} else {
+			reply.Err = TimeOut
+		}
+	case <-time.After(time.Millisecond * 33):
+		reply.Err = TimeOut
+	}
+
+	go func() {
+		kv.mu.Lock()
+		delete(kv.ComNotify, index)
+		kv.mu.Unlock()
+	}()
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
@@ -90,7 +280,17 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.ClientId2ComId = make(map[int64]int)
+	kv.ComNotify = make(map[int]chan Op)
+	kv.StateMachine = &MemoryKV{make(map[string]string)}
 
+	// read snapshot
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		kv.DecodeSnapshot(snapshot)
+	}
+
+	go kv.apply()
 	// You may need initialization code here.
 
 	return kv

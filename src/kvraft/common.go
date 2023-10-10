@@ -4,6 +4,7 @@ const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
+	TimeOut        = "TimeOut"
 )
 
 type Err string
@@ -25,9 +26,24 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	CommandId int
+	ClientId  int64
 }
 
 type GetReply struct {
+	Err   Err
+	Value string
+}
+
+type CommandArgs struct {
+	Key       string
+	Value     string
+	Op        string
+	CommandId int
+	ClientId  int64
+}
+
+type CommandReply struct {
 	Err   Err
 	Value string
 }

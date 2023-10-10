@@ -1,13 +1,19 @@
 package kvraft
 
-import "6.5840/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
 
+	"6.5840/labrpc"
+)
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+
+	LeaderId  int
+	CommandId int
+	ClientId  int64
 }
 
 func nrand() int64 {
@@ -21,7 +27,38 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.ClientId = nrand()
+	ck.CommandId = 1
+
 	return ck
+}
+
+// rpc command
+func (ck *Clerk) Command(args *CommandArgs) string {
+	args.ClientId = ck.ClientId
+	args.CommandId = ck.CommandId
+	LeaderId := ck.LeaderId
+	for {
+		reply := CommandReply{}
+		ok := ck.servers[LeaderId].Call("KVServer.Command", args, &reply)
+
+		if ok {
+
+			switch reply.Err {
+			case OK:
+				ck.LeaderId = LeaderId
+				ck.CommandId++
+				return reply.Value
+			case ErrNoKey:
+				ck.LeaderId = LeaderId
+				ck.CommandId++
+				return ""
+
+			}
+		}
+		LeaderId = (LeaderId + 1) % len(ck.servers)
+
+	}
 }
 
 // fetch the current value for a key.
@@ -37,7 +74,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	return ck.Command(&CommandArgs{Key: key, Value: "", Op: "Get"})
 }
 
 // shared by Put and Append.
@@ -50,6 +87,7 @@ func (ck *Clerk) Get(key string) string {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	ck.Command(&CommandArgs{Key: key, Value: value, Op: op})
 }
 
 func (ck *Clerk) Put(key string, value string) {

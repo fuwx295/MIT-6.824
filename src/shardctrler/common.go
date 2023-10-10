@@ -29,7 +29,13 @@ type Config struct {
 }
 
 const (
-	OK = "OK"
+	OK          = "OK"
+	WrongLeader = "WrongLeader"
+	//Op
+	Join  = "Join"
+	Move  = "Move"
+	Leave = "Leave"
+	Query = "Query"
 )
 
 type Err string
@@ -70,4 +76,20 @@ type QueryReply struct {
 	WrongLeader bool
 	Err         Err
 	Config      Config
+}
+
+type CommandArgs struct {
+	Servers   map[int][]string //Join
+	GIDs      []int            //leave
+	Shard     int              //Move
+	GID       int              //Move
+	Num       int              //Query
+	Op        string
+	ClientId  int64
+	CommandId int
+}
+
+type CommandReply struct {
+	Err    Err
+	Config Config
 }
