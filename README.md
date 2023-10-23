@@ -1,5 +1,6 @@
 # MIT-6.824
 Distributed System
+> using raft to implement a Shard-KV Fault-tolerant Storage System
 
 ## lab1 MapReduce
 [MapReduce Paper](https://greywind.cn/mapreduce-paper)
